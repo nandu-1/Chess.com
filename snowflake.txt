@@ -1,0 +1,252 @@
+CREATE OR REPLACE STORAGE INTEGRATION my_s3_int
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = 'S3'
+ENABLED = TRUE
+STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::476475856987:role/my_snowflake_role'
+STORAGE_ALLOWED_LOCATIONS = ('s3://my-chess-data/');
+
+desc integration my_s3_int;
+
+
+create or replace warehouse TRAINING_WH01 with
+  warehouse_size='X-LARGE'
+  auto_suspend = 360
+  auto_resume = true
+  initially_suspended=false;
+  
+use warehouse TRAINING_WH01;
+
+create database chess_db;
+
+use chess_db;
+
+create or replace stage chess_db.public.ext_stage
+  url = "s3://my-chess-data/"
+  storage_integration = my_s3_int
+  file_format = (type = json);
+
+CREATE OR REPLACE TABLE list_json(list_raw variant);
+CREATE OR REPLACE TABLE profile_json(profile_raw variant);
+CREATE OR REPLACE TABLE stats_json(stats_raw variant);
+
+CREATE or replace PIPE chess_db.public.list_pipe auto_ingest=true as
+COPY INTO list_json from 
+@chess_db.public.ext_stage/streamers/;
+
+CREATE OR REPLACE PIPE chess_db.public.profile_pipe auto_ingest=true as
+COPY INTO profile_json from
+@chess_db.public.ext_stage/profile/;
+
+CREATE OR REPLACE PIPE chess_db.public.stats_pipe auto_ingest=true as
+COPY INTO stats_json from
+@chess_db.public.ext_stage/stats/;
+
+show pipes;
+
+list @chess_db.public.ext_stage;
+
+select * from list_json;
+select * from profile_json;
+select * from stats_json;
+
+
+#Streamers:
+-----------
+
+CREATE OR REPLACE TABLE streamers_src (username string, is_community_streamer string, is_live string, member_url string, PRIMARY KEY(username));
+
+CREATE TABLE streamers_dest LIKE streamers_src;
+
+CREATE STREAM list_stream on table streamers_src;
+
+INSERT INTO streamers_src
+SELECT 
+concat((upper(substr(value:username::string,1,1))),(substr(value:username::string,2))) as username,
+value:is_community_streamer::string as is_community_streamer,
+value:is_live::string as is_live,
+value:url::string as  member_url
+from list_json, lateral flatten( input => list_raw:streamers);
+
+SELECT * FROM streamers_src;
+
+SELECT * FROM list_stream;
+
+MERGE into streamers_dest as T
+using (select *
+from list_stream) AS S
+ON T.username = S.username
+when matched AND S.metadata$action = 'INSERT' AND S.metadata$isupdate
+THEN
+update set T.username=S.username, T.is_community_streamer=S.is_community_streamer, T.is_live=S.is_live, T.member_url=S.member_url
+when not matched
+And S.metadata$action = 'INSERT' THEN
+INSERT (username, is_community_streamer, is_live, member_url)
+VALUES (S.username, S.is_community_streamer, S.is_live, S.member_url);
+
+SELECT * FROM streamers_dest;
+
+
+
+#PLayer Profile:
+----------------
+
+CREATE OR REPLACE TABLE player_profile_src (username string, player_name string, player_id string, title string, status string, is_streamer string, followers string, 
+                                            joined_date date,last_online date, country string, location string, PRIMARY KEY(username));
+CREATE TABLE player_profile_dest LIKE player_profile_src;
+
+CREATE STREAM profile_stream on table player_profile_src;
+
+INSERT INTO player_profile_src
+SELECT concat((upper(substr(value:username::string,1,1))),(substr(value:username::string,2)))  as username,
+value:name::string as player_name,
+value:player_id::string as player_id,
+value:title::string as title,
+value:status::string as status,
+value:is_streamer::string as is_streamer,
+value:followers::number as followers,
+to_date(value:joined::string) as joined_date,
+to_date(value:last_online::string) as last_online,
+substr(value:country::string,35) as country,
+value:location::string as location
+from profile_json, lateral flatten( input => profile_raw:players);
+
+SELECT * from player_profile_src;
+
+SELECT * FROM profile_stream;
+
+MERGE into player_profile_dest as T
+using (select *
+from profile_stream) AS S
+ON T.username = S.username
+when matched AND S.metadata$action = 'INSERT' AND S.metadata$isupdate
+THEN
+update set T.username=S.username, T.player_name=S.player_name, T.player_id=S.player_id, T.title=S.title, T.status=S.status, 
+T.is_streamer=S.is_streamer, T.followers=S.followers, T.joined_date=S.joined_date, T.last_online=S.last_online, T.country=S.country, T.location=S.location
+when not matched
+And S.metadata$action = 'INSERT' THEN
+INSERT (username, player_name, player_id, title, status, is_streamer, followers, joined_date, last_online, country, location)
+VALUES (S.username, S.player_name, S.player_id, S.title, S.status, S.is_streamer, S.followers, S.joined_date, S.last_online, S.country, S.location);
+
+SELECT * FROM player_profile_dest;
+
+
+
+
+#Player Stats:
+--------------
+
+CREATE OR REPLACE TABLE player_stats_src (username string, fide int, blitz_best_rating string, blitz_latest_rating string, blitz_latest_ranking string, blitz_records_draw int, blitz_records_lost int, blitz_records_won int,
+                                     bullet_best_rating string, bullet_latest_rating string, bullet_latest_ranking string, bullet_records_draw int, bullet_records_lost string, bullet_records_won string,
+                                     daily_best_rating string, daily_latest_rating string, daily_latest_ranking string, daily_records_draw int, daily_records_lost int, daily_records_won int,
+                                     rapid_best_rating string, rapid_latest_rating string, rapid_latest_ranking string, rapid_records_draw int, rapid_records_lost int, rapid_records_won int,
+                                     puzzle_rush_best_attempts int, puzzle_rush_best_score int, PRIMARY KEY(username));
+
+CREATE TABLE player_stats_dest LIKE player_stats_src;
+
+CREATE STREAM stats_stream on table player_stats_src;
+
+INSERT INTO player_stats_src
+select 
+concat((upper(substr(r.key,1,1))),(substr(r.key,2))) as username,
+r.value:fide as fide,
+r.value:chess_blitz:best:rating as blitz_best_rating,
+r.value:chess_blitz:last:rating as blitz_latest_rating,
+r.value:chess_blitz:last:rd as blitz_latest_ranking,
+r.value:chess_blitz:record:draw as blitz_records_draw,
+r.value:chess_blitz:record:loss as blitz_records_lost,
+r.value:chess_blitz:record:win as blitz_records_won,
+
+r.value:chess_bullet:best:rating as bullet_best_rating,
+r.value:chess_bullet:last:rating as bullet_latest_rating,
+r.value:chess_bullet:last:rd as bullet_latest_ranking,
+r.value:chess_bullet:record:draw as bullet_records_draw,
+r.value:chess_bullet:record:loss as bullet_records_lost,
+r.value:chess_bullet:record:win as bullet_records_won,
+
+r.value:chess_daily:best:rating as daily_best_rating,
+r.value:chess_daily:last:rating as daily_latest_rating,
+r.value:chess_daily:last:rd as daily_latest_ranking,
+r.value:chess_daily:record:draw as daily_records_draw,
+r.value:chess_daily:record:loss as daily_records_lost,
+r.value:chess_daily:record:win as daily_records_won,
+
+r.value:chess_rapid:best:rating as rapid_best_rating,
+r.value:chess_rapid:last:rating as rapid_latest_rating,
+r.value:chess_rapid:last:rd as rapid_latest_ranking,
+r.value:chess_rapid:record:draw as rapid_records_draw,
+r.value:chess_rapid:record:loss as rapid_records_lost,
+r.value:chess_rapid:record:win as rapid_records_won,
+
+r.value:puzzle_rush:best:total_attempts as puzzle_rush_best_attempts,
+r.value:puzzle_rush:best:score as puzzle_rush_best_score
+
+from stats_json,
+lateral flatten(stats_raw:stats)t,
+lateral flatten(t.value)r;
+
+
+SELECT * FROM player_stats_src;
+
+SELECT * FROM stats_stream;
+
+MERGE into player_stats_dest as T
+using (select *
+from stats_stream) AS S
+ON T.username = S.username
+when matched AND S.metadata$action = 'INSERT' AND S.metadata$isupdate
+THEN
+update set T.username=S.username, T.fide=S.fide, T.blitz_best_rating=S.blitz_best_rating, T.blitz_latest_rating=S.blitz_latest_rating, T.blitz_latest_ranking=S.blitz_latest_ranking, 
+T.blitz_records_draw=S.blitz_records_draw, T.blitz_records_lost=S.blitz_records_lost, T.blitz_records_won=S.blitz_records_won, T.bullet_best_rating=S.bullet_best_rating, 
+T.bullet_latest_rating=S.bullet_latest_rating, T.bullet_latest_ranking=S.bullet_latest_ranking, 
+T.bullet_records_draw=S.bullet_records_draw, T.bullet_records_lost=S.bullet_records_lost, T.bullet_records_won=S.bullet_records_won, 
+T.daily_best_rating=S.daily_best_rating, T.daily_latest_rating=S.daily_latest_rating, T.daily_latest_ranking=S.daily_latest_ranking, 
+T.daily_records_draw=S.daily_records_draw, T.daily_records_lost=S.daily_records_lost, T.daily_records_won=S.daily_records_won,
+T.rapid_best_rating=S.rapid_best_rating, T.rapid_latest_rating=S.rapid_latest_rating, T.rapid_latest_ranking=S.rapid_latest_ranking, 
+T.rapid_records_draw=S.rapid_records_draw, T.rapid_records_lost=S.rapid_records_lost, T.rapid_records_won=S.rapid_records_won,
+T.puzzle_rush_best_attempts=S.puzzle_rush_best_attempts, T.puzzle_rush_best_score=S.puzzle_rush_best_score
+when not matched
+And S.metadata$action = 'INSERT' THEN
+INSERT (username, fide, blitz_best_rating, blitz_latest_rating, blitz_latest_ranking, blitz_records_draw, blitz_records_lost, blitz_records_won,
+                                     bullet_best_rating, bullet_latest_rating, bullet_latest_ranking, bullet_records_draw, bullet_records_lost, bullet_records_won,
+                                     daily_best_rating, daily_latest_rating, daily_latest_ranking, daily_records_draw, daily_records_lost, daily_records_won,
+                                     rapid_best_rating, rapid_latest_rating, rapid_latest_ranking, rapid_records_draw, rapid_records_lost, rapid_records_won,
+                                     puzzle_rush_best_attempts, puzzle_rush_best_score)
+VALUES (S.username, S.fide, S.blitz_best_rating, S.blitz_latest_rating, S.blitz_latest_ranking, S.blitz_records_draw, S.blitz_records_lost, S.blitz_records_won,
+                                     S.bullet_best_rating, S.bullet_latest_rating, S.bullet_latest_ranking, S.bullet_records_draw, S.bullet_records_lost, S.bullet_records_won,
+                                     S.daily_best_rating, S.daily_latest_rating, S.daily_latest_ranking, S.daily_records_draw, S.daily_records_lost, S.daily_records_won,
+                                     S.rapid_best_rating, S.rapid_latest_rating, S.rapid_latest_ranking, S.rapid_records_draw, S.rapid_records_lost, S.rapid_records_won,
+                                     S.puzzle_rush_best_attempts, S.puzzle_rush_best_score);
+SELECT * FROM player_stats_dest;
+
+
+DELETE FROM player_stats_src;
+DELETE FROM player_profile_src;
+DELETE FROM streamers_src;
+
+list @chess_db.public.ext_stage;
+
+delete from list_json;
+delete from profile_json;
+delete from stats_json;
+
+SELECT *  from list_json;
+SELECT *  from profile_json;
+SELECT *  from stats_json;
+
+remove @chess_db.public.ext_stage;
+
+
+#No of users streaming live
+SELECT COUNT(*) from streamers_dest where is_live='true';
+
+#The info of live streaming users
+SELECT ST.username,player_name,player_id from streamers_dest ST inner join player_profile_dest PR on ST.username=PR.username where ST.is_live='true'
+
+#highest no of followers in a country
+SELECT COUNTRY, SUM(followers) FROM player_profile_dest group by country;
+
+#Users with highest no of followers
+SELECT distinct(username), followers, country from player_profile_dest order by followers desc limit 1;
+
+#Users who have FIDE(ELO)
+SELECT distinct(PS.username), fide , title from player_stats_dest PS inner join player_profile_dest PR on PS.username=PR.username where fide IS NOT NULL order by fide desc;
